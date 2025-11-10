@@ -1,0 +1,11 @@
+scikit-learn
+matplotlib
+seaborn
+pandas
+librosa
+streamlit
+tensorflow
+opencv-python-headless
+numpy
+streamlit-webrtc
+av

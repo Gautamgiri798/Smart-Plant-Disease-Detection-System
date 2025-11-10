@@ -1,0 +1,15 @@
+# Ignore the large dataset
+Dataset/
+
+# Ignore large model files
+*.keras
+*.h5
+
+# Ignore Python virtual environments
+venv/
+*.env
+
+# Ignore temporary files
+.ipynb_checkpoints/
+*.json
+~$*
