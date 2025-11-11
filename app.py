@@ -7,7 +7,6 @@ from collections import deque
 # -----------------------------
 # Load Model (Global)
 # -----------------------------
-# Model is loaded once when the script starts
 print("Loading model...")
 model = tf.keras.models.load_model("trained_model.keras")
 print("Model loaded.")
@@ -37,36 +36,61 @@ class_names = [
 ]
 
 # -----------------------------
-# Global state for stabilization
+# Global state for stabilization (for streaming only)
 # -----------------------------
-# Use a deque to stabilize predictions over the last N frames
-history = deque(maxlen=5) # Same as your original script
+history = deque(maxlen=5) 
 
 # -----------------------------
-# Preprocessing Function (from your original script)
+# Preprocessing Function (CRITICAL FIX)
 # -----------------------------
 def preprocess_frame(frame):
-    # Webcam frames are numpy arrays (H, W, C) in BGR format
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Model expects RGB
-    img_resized = cv2.resize(img_rgb, (64, 64))
+    """
+    Handles any input frame (RGB, RGBA, Grayscale) from Gradio and
+    converts it to the exact (64, 64) BGR format your model was trained on.
+    """
+    
+    # --- 1. Robustly convert to 3-channel RGB ---
+    if len(frame.shape) == 2:
+        # It's Grayscale (H, W)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 1:
+        # It's Grayscale (H, W, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 4:
+        # It's RGBA (H, W, 4)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+    else:
+        # It's already 3-channel RGB (H, W, 3)
+        frame_rgb = frame
+
+    # --- 2. Convert from RGB to BGR (as model expects) ---
+    # Your original script used cv2.VideoCapture, which provides BGR frames.
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    # --- 3. Resize to model's input size (64, 64) ---
+    # Your original script used (64, 64).
+    img_resized = cv2.resize(frame_bgr, (64, 64))
+
+    # --- 4. Normalize and add batch dimension ---
     img_normalized = img_resized / 255.0
+    img_normalized = img_normalized.astype(np.float32)
     img_batch = np.expand_dims(img_normalized, axis=0)
+    
     return img_batch
 
 # -----------------------------
-# Prediction Function (This replaces the Transformer class)
+# Prediction Function for STREAMING (Webcam)
 # -----------------------------
-def predict_disease(frame):
+def predict_stream(frame):
     """
-    This function takes a single frame from the webcam (as a numpy array)
-    and returns a single annotated frame (as a numpy array).
+    Takes a single RGB frame, predicts, and returns an annotated RGB frame.
+    Uses 'history' deque for stabilization.
     """
     if frame is None:
         return None
-
-    # Note: Gradio's webcam input is already mirrored, so no cv2.flip() needed.
     
     # 1. Preprocess and predict
+    # (preprocess_frame now handles RGB -> BGR conversion)
     preprocessed_img = preprocess_frame(frame)
     prediction = model.predict(preprocessed_img, verbose=0)
     predicted_class = np.argmax(prediction)
@@ -79,54 +103,106 @@ def predict_disease(frame):
     else:
         label = "Initializing..."
 
-    # 3. Draw label on the *original* frame
-    # (Gradio component will display this frame)
-    cv2.putText(frame, f"Prediction: {label}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-    # 4. Return the annotated frame (in BGR for cv2)
-    return frame
+    # 3. Return the original frame and the label text
+    # (All cv2.putText and color conversion logic removed)
+    return frame, label
 
 # -----------------------------
-# Gradio Interface
+# Prediction Function for UPLOAD (Single Image)
+# -----------------------------
+def predict_upload(frame):
+    """
+    Takes a single RGB frame, predicts, and returns an annotated RGB frame.
+    Does NOT use 'history' deque.
+    """
+    if frame is None:
+        return None
+    
+    # 1. Preprocess and predict
+    # (preprocess_frame now handles RGB -> BGR conversion)
+    preprocessed_img = preprocess_frame(frame)
+    prediction = model.predict(preprocessed_img, verbose=0)
+    predicted_class = np.argmax(prediction)
+    
+    # 2. Get label (no stabilization needed)
+    label = class_names[predicted_class]
+
+    # 3. Robustly convert original frame to RGB for display
+    # (This logic is still needed so the output image displays correctly)
+    if len(frame.shape) == 2:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 1:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 4:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+    else:
+        frame_rgb = frame.copy()
+
+    # 4. Return the RGB frame and the label text
+    # (All cv2.putText and color conversion logic removed)
+    return frame_rgb, label
+
+# -----------------------------
+# Gradio Interface (with Tabs)
 # -----------------------------
 
-# Use gr.Blocks for a custom layout
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
         # 🌱 Real-Time Plant Disease Detection
-        This app uses a trained CNN to detect plant diseases from your webcam feed.
-        Allow webcam access and point a plant leaf at the camera.
+        This app uses a trained CNN to detect plant diseases.
+        Use the tabs below to either start a live webcam feed or upload an image.
         """
     )
     
-    with gr.Row():
-        # Input: Webcam, streaming
-        webcam_input = gr.Image(
-            sources=["webcam"],  # <--- THE FIX IS HERE
-            streaming=True,
-            label="Webcam Feed"
-        )
-        
-        # Output: Annotated image
-        annotated_output = gr.Image(
-            label="Prediction"
-        )
-        
-    # This "stream" event connects the input to the function to the output
-    # It runs the `predict_disease` function on every frame
-    webcam_input.stream(predict_disease, webcam_input, annotated_output)
-    
-    # Recreate the sidebar elements using Accordions
+    with gr.Tabs():
+        # --- Tab 1: Live Detection ---
+        with gr.TabItem("Live Detection"):
+            with gr.Row():
+                webcam_input = gr.Image(
+                    sources=["webcam"],
+                    streaming=True,
+                    label="Webcam Feed"
+                )
+                webcam_output = gr.Image(label="Prediction")
+            
+            # --- NEW: Add a Label output for the prediction ---
+            webcam_label = gr.Label(label="Result")
+            
+            webcam_input.stream(
+                predict_stream, 
+                webcam_input, 
+                [webcam_output, webcam_label] # --- UPDATED: Output to both components ---
+            )
+
+        # --- Tab 2: Upload Image ---
+        with gr.TabItem("Upload Image"):
+            with gr.Row():
+                upload_input = gr.Image(
+                    sources=["upload"],
+                    label="Upload a plant image",
+                    type="numpy"
+                )
+                upload_output = gr.Image(label="Prediction")
+            
+            # --- NEW: Add a Label output for the prediction ---
+            upload_label = gr.Label(label="Result")
+
+            upload_input.upload(
+                predict_upload, 
+                upload_input, 
+                [upload_output, upload_label] # --- UPDATED: Output to both components ---
+            )
+            
+    # --- Accordions for extra info ---
     with gr.Accordion("About this App"):
-        gr.Markdown("This project is based on your 'smart plant disease detection' work. It uses TensorFlow to classify plant diseases in real-time.")
+        gr.Markdown("This project uses a TensorFlow/Keras CNN model to classify 38 different plant disease categories in real-time.")
     
     with gr.Accordion("Show all 38 classes"):
-        gr.JSON(class_names) # Use JSON component to display the list cleanly
+        gr.JSON(class_names) 
 
 # -----------------------------
 # Launch the App
 # -----------------------------
 if __name__ == "__main__":
-    demo.launch() # share=True to get a public link
+    demo.launch()
