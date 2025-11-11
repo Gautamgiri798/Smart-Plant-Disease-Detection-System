@@ -1,34 +1,19 @@
-import streamlit as st
+import gradio as gr
 import cv2
 import tensorflow as tf
 import numpy as np
 from collections import deque
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
-import av # Important for handling video frames
 
 # -----------------------------
-# App Title and Description
+# Load Model (Global)
 # -----------------------------
-st.set_page_config(page_title="Plant Disease Detection", page_icon="🌱")
-st.title("🌱 Real-Time Plant Disease Detection")
-st.write("This app uses a trained CNN to detect plant diseases from your webcam feed.")
-st.info("Click 'START' to open your webcam. The prediction will appear on the video feed.")
+# Model is loaded once when the script starts
+print("Loading model...")
+model = tf.keras.models.load_model("trained_model.keras")
+print("Model loaded.")
 
 # -----------------------------
-# Load Model (Cached)
-# -----------------------------
-# Use st.cache_resource to load the model only once
-@st.cache_resource
-def load_my_model():
-    print("Loading model...")
-    model = tf.keras.models.load_model("trained_model.keras")
-    print("Model loaded.")
-    return model
-
-model = load_my_model()
-
-# -----------------------------
-# Class Labels (from your original script)
+# Class Labels
 # -----------------------------
 class_names = [
     'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
@@ -52,67 +37,96 @@ class_names = [
 ]
 
 # -----------------------------
+# Global state for stabilization
+# -----------------------------
+# Use a deque to stabilize predictions over the last N frames
+history = deque(maxlen=5) # Same as your original script
+
+# -----------------------------
 # Preprocessing Function (from your original script)
 # -----------------------------
 def preprocess_frame(frame):
-    img = cv2.resize(frame, (64, 64))
-    img = img / 255.0
-    img = np.expand_dims(img, axis=0)
-    return img
+    # Webcam frames are numpy arrays (H, W, C) in BGR format
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Model expects RGB
+    img_resized = cv2.resize(img_rgb, (64, 64))
+    img_normalized = img_resized / 255.0
+    img_batch = np.expand_dims(img_normalized, axis=0)
+    return img_batch
 
 # -----------------------------
-# Video Transformer Class
+# Prediction Function (This replaces the Transformer class)
 # -----------------------------
-class PlantDiseaseTransformer(VideoTransformerBase):
-    def __init__(self):
-        # Use a deque to stabilize predictions over the last N frames
-        self.history = deque(maxlen=5) # Same as your original script
-        print("Transformer initialized.")
+def predict_disease(frame):
+    """
+    This function takes a single frame from the webcam (as a numpy array)
+    and returns a single annotated frame (as a numpy array).
+    """
+    if frame is None:
+        return None
 
-    def transform(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Convert the av.VideoFrame to a NumPy array (BGR format)
-        img = frame.to_ndarray(format="bgr24")
+    # Note: Gradio's webcam input is already mirrored, so no cv2.flip() needed.
+    
+    # 1. Preprocess and predict
+    preprocessed_img = preprocess_frame(frame)
+    prediction = model.predict(preprocessed_img, verbose=0)
+    predicted_class = np.argmax(prediction)
+    history.append(predicted_class)
 
-        # Replicate your original logic
-        img_flipped = cv2.flip(img, 1) # Mirror view
+    # 2. Stabilize prediction
+    if len(history) > 0:
+        label_index = max(set(history), key=history.count)
+        label = class_names[label_index]
+    else:
+        label = "Initializing..."
 
-        # Preprocess and predict
-        preprocessed_img = preprocess_frame(img_flipped)
-        prediction = model.predict(preprocessed_img, verbose=0)
-        predicted_class = np.argmax(prediction)
-        self.history.append(predicted_class)
+    # 3. Draw label on the *original* frame
+    # (Gradio component will display this frame)
+    cv2.putText(frame, f"Prediction: {label}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        # Stabilize prediction by taking the most common
-        if len(self.history) > 0:
-            label_index = max(set(self.history), key=self.history.count)
-            label = class_names[label_index]
-        else:
-            label = "Initializing..."
-
-        # Draw label on the *flipped* frame
-        cv2.putText(img_flipped, f"Prediction: {label}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        # Convert the modified NumPy array back to an av.VideoFrame
-        return av.VideoFrame.from_ndarray(img_flipped, format="bgr24")
+    # 4. Return the annotated frame (in BGR for cv2)
+    return frame
 
 # -----------------------------
-# Streamlit WebRTC Component
+# Gradio Interface
 # -----------------------------
-webrtc_streamer(
-    key="plant-disease-detection",
-    video_transformer_factory=PlantDiseaseTransformer,
-    media_stream_constraints={
-        "video": True,
-        "audio": False
-    },
-    rtc_configuration={  # This is needed for deployment on platforms like Streamlit Cloud
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    },
-    async_processing=True,
-)
 
-st.sidebar.header("About")
-st.sidebar.info("This project is based on your 'smart plant disease detection' work. It uses TensorFlow to classify plant diseases in real-time.")
-st.sidebar.header("Class Names")
-st.sidebar.expander("Show all 38 classes").json(class_names)
+# Use gr.Blocks for a custom layout
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # 🌱 Real-Time Plant Disease Detection
+        This app uses a trained CNN to detect plant diseases from your webcam feed.
+        Allow webcam access and point a plant leaf at the camera.
+        """
+    )
+    
+    with gr.Row():
+        # Input: Webcam, streaming
+        webcam_input = gr.Image(
+            sources=["webcam"],  # <--- THE FIX IS HERE
+            streaming=True,
+            label="Webcam Feed"
+        )
+        
+        # Output: Annotated image
+        annotated_output = gr.Image(
+            label="Prediction"
+        )
+        
+    # This "stream" event connects the input to the function to the output
+    # It runs the `predict_disease` function on every frame
+    webcam_input.stream(predict_disease, webcam_input, annotated_output)
+    
+    # Recreate the sidebar elements using Accordions
+    with gr.Accordion("About this App"):
+        gr.Markdown("This project is based on your 'smart plant disease detection' work. It uses TensorFlow to classify plant diseases in real-time.")
+    
+    with gr.Accordion("Show all 38 classes"):
+        gr.JSON(class_names) # Use JSON component to display the list cleanly
+
+# -----------------------------
+# Launch the App
+# -----------------------------
+if __name__ == "__main__":
+    demo.launch() # share=True to get a public link
